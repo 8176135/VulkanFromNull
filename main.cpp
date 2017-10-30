@@ -3,6 +3,7 @@
 #include <functional>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 #define GLFW_INCLUDE_VULKAN
 
@@ -44,9 +45,9 @@ void DestroyDebugReportCallbackEXT(VkInstance instance, VkDebugReportCallbackEXT
 
 struct QueueFamilyIndices {
     int graphicsFamily = -1;
-
+    int presentFamily = -1;
     bool isComplete() {
-        return graphicsFamily >= 0;
+        return graphicsFamily >= 0 && presentFamily >= 0;
     }
 };
 
@@ -63,6 +64,12 @@ private:
     GLFWwindow *window;
     VkInstance instance;
     VkDebugReportCallbackEXT debugReportCallbackExt;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice logicalDevice;
+    VkSurfaceKHR surface;
+
+    VkQueue graphicsQueue;
+    VkQueue presentQueue;
 
 private:
     void initWindow() {
@@ -76,7 +83,9 @@ private:
     void initVulkan() {
         createInstance();
         setupDebugCallback();
+        createSurface();
         pickPhysicalDevice();
+        createLogicalDevice();
     }
 
     void createInstance() {
@@ -146,6 +155,12 @@ private:
         }
     }
 
+    void createSurface() {
+        if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create window surface");
+        }
+    }
+
     bool checkValidationLayerSupport() {
         uint32_t layerCount;
         vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
@@ -188,8 +203,6 @@ private:
     }
 
     void pickPhysicalDevice() {
-        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-
         uint32_t deviceCount = 0;
         vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
         if (deviceCount == 0) {
@@ -214,8 +227,8 @@ private:
         vkGetPhysicalDeviceFeatures(device, &deviceFeatures);
 
         return (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) &&
-                deviceFeatures.geometryShader &&
-                findQueueFamilies(device).isComplete();
+               deviceFeatures.geometryShader &&
+               findQueueFamilies(device).isComplete();
     }
 
     QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) {
@@ -227,13 +240,75 @@ private:
         std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
         vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
 
-        auto graphicsIndex = std::find_if(queueFamilies.begin(), queueFamilies.end(), [](VkQueueFamilyProperties currentQueue) {
-            return currentQueue.queueCount > 0 && (currentQueue.queueFlags & VK_QUEUE_GRAPHICS_BIT);
-        }) - queueFamilies.begin();
-        if (graphicsIndex < queueFamilies.size()) {
-            indices.graphicsFamily = (int)graphicsIndex;
+        for (int i = 0; i < queueFamilyCount; ++i) {
+            if (queueFamilies[i].queueCount > 0 && queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                indices.graphicsFamily = i;
+            }
+
+            VkBool32 presentSupport = false;
+            vkGetPhysicalDeviceSurfaceSupportKHR(device, (uint32_t)i, surface, &presentSupport);
+
+            if (queueFamilies[i].queueCount > 0 && presentSupport) {
+                indices.presentFamily = i;
+            }
+
+            if (indices.isComplete()) {
+                break;
+            }
         }
+
+//        auto graphicsIndex = std::find_if(queueFamilies.begin(), queueFamilies.end(), [](VkQueueFamilyProperties currentQueue) {
+//            return currentQueue.queueCount > 0 && (currentQueue.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+//        }) - queueFamilies.begin();
+//
+//        if (graphicsIndex < queueFamilies.size()) {
+//            indices.graphicsFamily = (int) graphicsIndex;
+//        }
+
         return indices;
+    }
+
+    void createLogicalDevice() {
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+
+        std::vector<VkDeviceQueueCreateInfo> deviceInfoList;
+        std::set<int> queueFamiliesUnique = {indices.presentFamily, indices.graphicsFamily};
+        //std::cout << "Number of queue's in set: " << queueFamiliesUnique.size() << std::endl;
+        
+        for (auto currentQueueFamily : queueFamiliesUnique) {
+            VkDeviceQueueCreateInfo queueCreateInfo = {};
+            queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.queueFamilyIndex = static_cast<uint32_t>(currentQueueFamily);
+            //TODO: might be a problem here
+            float queuePriority = 0.8f;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+
+            deviceInfoList.push_back(queueCreateInfo);
+        }
+
+        VkPhysicalDeviceFeatures deviceFeatures = {};
+
+        VkDeviceCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        createInfo.pQueueCreateInfos = deviceInfoList.data();
+        createInfo.queueCreateInfoCount = static_cast<uint32_t>(deviceInfoList.size());
+        createInfo.pEnabledFeatures = &deviceFeatures;
+        createInfo.enabledExtensionCount = 0;
+
+        if (enableValidationLayers) {
+            createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
+            createInfo.ppEnabledLayerNames = validationLayers.data();
+        } else {
+            createInfo.enabledLayerCount = 0;
+        }
+
+        if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &logicalDevice) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create logical device");
+        }
+
+        vkGetDeviceQueue(logicalDevice, (uint32_t) indices.graphicsFamily, 0, &graphicsQueue);
+        vkGetDeviceQueue(logicalDevice, (uint32_t) indices.presentFamily, 0, &presentQueue);
     }
 
     void mainLoop() {
@@ -245,8 +320,9 @@ private:
 
     void cleanup() {
         DestroyDebugReportCallbackEXT(instance, debugReportCallbackExt, nullptr);
+        vkDestroyDevice(logicalDevice, nullptr);
+        vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroyInstance(instance, nullptr);
-
         glfwDestroyWindow(window);
         glfwTerminate();
     }
@@ -260,9 +336,7 @@ private:
             const char *layerPrefix,
             const char *msg,
             void *userData) {
-
         std::cerr << "validation layer: " << msg << std::endl;
-
         return VK_FALSE;
     }
 };
